@@ -1,0 +1,15 @@
+Driver-related patches (dropped at every major release if they are not yet upstream):
+
+Ubuntu-specific features not supported anymore:
+
+Others:
+- UBUNTU: SAUCE: selftests/bpf: avoid conflicting data types in profiler.inc.h
+- UBUNTU: SAUCE: Revert "arm64/fpsimd: Make kernel_neon_ API _GPL"
+- UBUNTU: SAUCE: net: wwan: t7xx: PCIe reset rescan
+- UBUNTU: SAUCE: PCI/ASPM: Introduce a new helper to report ASPM capability
+- UBUNTU: SAUCE: Revert "mm: remove follow_pfn"
+
+6.14:
+ - UBUNTU: SAUCE: modpost: support arbitrary symbol length in modversion
+ - UBUNTU: SAUCE: allows to enable Rust with modversions
+ - UBUNTU: SAUCE: modpost: Replace 0-length array with flex-array member
