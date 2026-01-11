@@ -61,6 +61,14 @@ struct folio_batch;
 
 void page_writeback_init(void);
 
+/* RL-PAGE-REPLACEMENT: BEGIN */
+/*
+ * RL-based page replacement policy selector.
+ * Called from workingset.c to notify refaults.
+ */
+void rl_process_folio_refault_external(struct folio *folio);
+/* RL-PAGE-REPLACEMENT: END */
+
 /*
  * If a 16GB hugetlb folio were mapped by PTEs of all of its 4kB pages,
  * its nr_pages_mapped would be 0x400000: choose the ENTIRELY_MAPPED bit

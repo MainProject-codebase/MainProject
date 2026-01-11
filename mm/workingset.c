@@ -542,6 +542,14 @@ void workingset_refault(struct folio *folio, void *shadow)
 
 	VM_BUG_ON_FOLIO(!folio_test_locked(folio), folio);
 
+	/* RL-PAGE-REPLACEMENT: BEGIN */
+	/*
+	 * Notify the RL page replacement system about this refault.
+	 * This allows it to penalize the policy that evicted this page.
+	 */
+	rl_process_folio_refault_external(folio);
+	/* RL-PAGE-REPLACEMENT: END */
+
 	if (lru_gen_enabled()) {
 		lru_gen_refault(folio, shadow);
 		return;

@@ -71,6 +71,512 @@
 #define CREATE_TRACE_POINTS
 #include <trace/events/vmscan.h>
 
+/* RL-PAGE-REPLACEMENT: BEGIN */
+/*
+ * Reinforcement Learning-based Page Replacement Policy Selector
+ *
+ * This implementation follows the design from:
+ * "Virtual Memory Page Replacement using Reinforcement Learning"
+ *
+ * The RL agent uses a Multi-Armed Bandit approach to dynamically select
+ * among existing page replacement policies (LRU, Clock, FIFO-like behavior).
+ *
+ * Key components:
+ * 1. Policy Score Table (PolS) - maintains scores for each policy
+ * 2. Page Eviction History Table (PEcH) - tracks recently evicted pages
+ * 3. RL Agent - selects policies using epsilon-greedy exploration
+ */
+
+/* Configuration constants */
+#define RL_PECH_TABLE_SIZE		1024	/* Page eviction history size */
+#define RL_POLICY_SCORE_MAX		10000	/* Max score to prevent overflow */
+#define RL_POLICY_SCORE_MIN		(-10000) /* Min score to prevent underflow */
+#define RL_POLICY_SCORE_INIT		0	/* Initial policy score */
+#define RL_EXPLORATION_RATE		10	/* 10% exploration (out of 100) */
+#define RL_PENALTY_AMOUNT		5	/* Score penalty on refault */
+#define RL_REWARD_AMOUNT		1	/* Score reward on successful eviction */
+
+/* Enable/disable RL policy selector globally */
+static int rl_mm_enabled __read_mostly = 1;
+
+/* Debug mode - controlled by CONFIG_RL_MM_DEBUG */
+#ifdef CONFIG_RL_MM_DEBUG
+#define rl_debug(fmt, ...) pr_debug("rl_mm: " fmt, ##__VA_ARGS__)
+#else
+#define rl_debug(fmt, ...) do { } while (0)
+#endif
+
+/*
+ * Policy types supported by the RL agent.
+ * These map to different behaviors within the existing LRU framework.
+ */
+enum rl_policy_type {
+	RL_POLICY_LRU = 0,	/* Standard LRU - prefer inactive list tail */
+	RL_POLICY_CLOCK,	/* Clock-like - check referenced bit more aggressively */
+	RL_POLICY_FIFO,		/* FIFO-like - less consideration for access patterns */
+	RL_POLICY_NR_TYPES	/* Number of policy types */
+};
+
+static const char * const rl_policy_names[] = {
+	[RL_POLICY_LRU]   = "LRU",
+	[RL_POLICY_CLOCK] = "Clock",
+	[RL_POLICY_FIFO]  = "FIFO",
+};
+
+/*
+ * Policy Score Table (PolS) - tracks the effectiveness of each policy.
+ * Higher scores indicate better-performing policies.
+ */
+struct rl_policy_score {
+	enum rl_policy_type policy;
+	atomic_t score;
+};
+
+static struct rl_policy_score rl_pols_table[RL_POLICY_NR_TYPES] __read_mostly;
+static DEFINE_SPINLOCK(rl_pols_lock);
+
+/*
+ * Page Eviction History Table (PEcH) - fixed-size FIFO table
+ * tracking recently evicted pages for refault detection.
+ */
+struct rl_eviction_entry {
+	pid_t pid;			/* Process that owned the page */
+	unsigned long page_id;		/* Page frame number or unique ID */
+	unsigned long vaddr;		/* Virtual address of the page */
+	enum rl_policy_type evicted_by;	/* Policy that evicted this page */
+	unsigned long timestamp;	/* jiffies when evicted */
+	bool valid;			/* Entry is valid/in-use */
+};
+
+static struct rl_eviction_entry rl_pech_table[RL_PECH_TABLE_SIZE];
+static unsigned int rl_pech_head;	/* Next insertion point (FIFO) */
+static DEFINE_SPINLOCK(rl_pech_lock);
+
+/* Statistics for monitoring */
+static atomic_long_t rl_stat_policy_selections[RL_POLICY_NR_TYPES];
+static atomic_long_t rl_stat_refaults_detected;
+static atomic_long_t rl_stat_penalties_applied;
+
+/* Current active policy (per-CPU for reduced contention) */
+static DEFINE_PER_CPU(enum rl_policy_type, rl_current_policy);
+
+/*
+ * Initialize the RL page replacement system.
+ * Called once during kernel boot.
+ */
+static void __init rl_mm_init(void)
+{
+	int i;
+
+	/* Initialize policy score table */
+	for (i = 0; i < RL_POLICY_NR_TYPES; i++) {
+		rl_pols_table[i].policy = i;
+		atomic_set(&rl_pols_table[i].score, RL_POLICY_SCORE_INIT);
+	}
+
+	/* Initialize eviction history table */
+	memset(rl_pech_table, 0, sizeof(rl_pech_table));
+	rl_pech_head = 0;
+
+	/* Initialize per-CPU current policy */
+	for_each_possible_cpu(i)
+		per_cpu(rl_current_policy, i) = RL_POLICY_LRU;
+
+	rl_debug("RL page replacement initialized with %d policies\n",
+		 RL_POLICY_NR_TYPES);
+}
+
+/*
+ * Get the score for a policy (lock-free read).
+ */
+static inline int rl_get_policy_score(enum rl_policy_type policy)
+{
+	if (unlikely(policy >= RL_POLICY_NR_TYPES))
+		return RL_POLICY_SCORE_MIN;
+	return atomic_read(&rl_pols_table[policy].score);
+}
+
+/*
+ * Adjust the score for a policy with bounds checking.
+ * Positive delta for reward, negative for penalty.
+ */
+static void rl_adjust_policy_score(enum rl_policy_type policy, int delta)
+{
+	int old_score, new_score;
+
+	if (unlikely(policy >= RL_POLICY_NR_TYPES))
+		return;
+
+	do {
+		old_score = atomic_read(&rl_pols_table[policy].score);
+		new_score = old_score + delta;
+
+		/* Bounds checking */
+		if (new_score > RL_POLICY_SCORE_MAX)
+			new_score = RL_POLICY_SCORE_MAX;
+		else if (new_score < RL_POLICY_SCORE_MIN)
+			new_score = RL_POLICY_SCORE_MIN;
+
+		if (new_score == old_score)
+			return;
+	} while (atomic_cmpxchg(&rl_pols_table[policy].score,
+				old_score, new_score) != old_score);
+
+	rl_debug("Policy %s score adjusted: %d -> %d\n",
+		 rl_policy_names[policy], old_score, new_score);
+}
+
+/*
+ * Find the policy with the highest score (exploitation).
+ * Uses lock-free reads for performance.
+ */
+static enum rl_policy_type rl_get_best_policy(void)
+{
+	enum rl_policy_type best = RL_POLICY_LRU;
+	int best_score = rl_get_policy_score(RL_POLICY_LRU);
+	int i;
+
+	for (i = 1; i < RL_POLICY_NR_TYPES; i++) {
+		int score = rl_get_policy_score(i);
+		if (score > best_score) {
+			best_score = score;
+			best = i;
+		}
+	}
+
+	return best;
+}
+
+/*
+ * Select a random policy (exploration).
+ * Uses kernel RNG for probabilistic selection.
+ */
+static enum rl_policy_type rl_get_random_policy(void)
+{
+	return prandom_u32_max(RL_POLICY_NR_TYPES);
+}
+
+/*
+ * RL Agent: Select a policy using epsilon-greedy strategy.
+ * This is the main decision point for the Multi-Armed Bandit.
+ *
+ * With probability epsilon: explore (random policy)
+ * With probability 1-epsilon: exploit (best policy)
+ */
+static enum rl_policy_type rl_select_policy(void)
+{
+	enum rl_policy_type selected;
+	unsigned int rand_val;
+
+	if (unlikely(!rl_mm_enabled))
+		return RL_POLICY_LRU;
+
+	/* Epsilon-greedy selection using integer arithmetic */
+	rand_val = prandom_u32_max(100);
+
+	if (rand_val < RL_EXPLORATION_RATE) {
+		/* Exploration: pick random policy */
+		selected = rl_get_random_policy();
+		rl_debug("Exploration: selected policy %s\n",
+			 rl_policy_names[selected]);
+	} else {
+		/* Exploitation: pick best-scoring policy */
+		selected = rl_get_best_policy();
+		rl_debug("Exploitation: selected policy %s\n",
+			 rl_policy_names[selected]);
+	}
+
+	/* Update per-CPU current policy */
+	this_cpu_write(rl_current_policy, selected);
+
+	/* Update statistics */
+	atomic_long_inc(&rl_stat_policy_selections[selected]);
+
+	return selected;
+}
+
+/*
+ * Get the current policy for this CPU.
+ */
+static inline enum rl_policy_type rl_get_current_policy(void)
+{
+	if (unlikely(!rl_mm_enabled))
+		return RL_POLICY_LRU;
+	return this_cpu_read(rl_current_policy);
+}
+
+/*
+ * Record a page eviction in the PEcH table.
+ * Uses FIFO replacement when the table is full.
+ *
+ * @folio: The folio being evicted
+ * @policy: The policy that selected this page for eviction
+ */
+static void rl_record_eviction(struct folio *folio, enum rl_policy_type policy)
+{
+	struct rl_eviction_entry *entry;
+	unsigned long flags;
+	unsigned int idx;
+	unsigned long pfn;
+
+	if (unlikely(!rl_mm_enabled))
+		return;
+
+	pfn = folio_pfn(folio);
+
+	spin_lock_irqsave(&rl_pech_lock, flags);
+
+	/* Use FIFO insertion at head */
+	idx = rl_pech_head;
+	entry = &rl_pech_table[idx];
+
+	/* Record eviction details */
+	entry->pid = current->pid;
+	entry->page_id = pfn;
+	entry->vaddr = 0;  /* Can be extended to track vaddr if needed */
+	entry->evicted_by = policy;
+	entry->timestamp = jiffies;
+	entry->valid = true;
+
+	/* Advance FIFO head */
+	rl_pech_head = (rl_pech_head + 1) % RL_PECH_TABLE_SIZE;
+
+	spin_unlock_irqrestore(&rl_pech_lock, flags);
+
+	rl_debug("Recorded eviction: pfn=%lu by policy %s\n",
+		 pfn, rl_policy_names[policy]);
+}
+
+/*
+ * Check if a page was recently evicted and apply penalty if found.
+ * Called on page fault (refault detection).
+ *
+ * @pfn: Page frame number that faulted
+ *
+ * Returns: true if this was a refault (page found in history)
+ */
+static bool rl_check_refault_and_penalize(unsigned long pfn)
+{
+	unsigned long flags;
+	int i;
+	bool found = false;
+	enum rl_policy_type evicting_policy = RL_POLICY_LRU;
+
+	if (unlikely(!rl_mm_enabled))
+		return false;
+
+	spin_lock_irqsave(&rl_pech_lock, flags);
+
+	/* Search for the page in eviction history */
+	for (i = 0; i < RL_PECH_TABLE_SIZE; i++) {
+		struct rl_eviction_entry *entry = &rl_pech_table[i];
+
+		if (entry->valid && entry->page_id == pfn) {
+			/* Found! This is a refault */
+			evicting_policy = entry->evicted_by;
+			found = true;
+
+			/* Invalidate the entry after processing */
+			entry->valid = false;
+			break;
+		}
+	}
+
+	spin_unlock_irqrestore(&rl_pech_lock, flags);
+
+	if (found) {
+		/* Apply penalty to the policy that evicted this page */
+		rl_adjust_policy_score(evicting_policy, -RL_PENALTY_AMOUNT);
+
+		atomic_long_inc(&rl_stat_refaults_detected);
+		atomic_long_inc(&rl_stat_penalties_applied);
+
+		rl_debug("Refault detected: pfn=%lu, penalizing policy %s\n",
+			 pfn, rl_policy_names[evicting_policy]);
+	}
+
+	return found;
+}
+
+/*
+ * Check and process a folio refault.
+ * Called from the page fault path when a page is faulted back in.
+ *
+ * @folio: The folio that was faulted in
+ */
+static void rl_process_folio_refault(struct folio *folio)
+{
+	unsigned long pfn;
+
+	if (unlikely(!rl_mm_enabled))
+		return;
+
+	pfn = folio_pfn(folio);
+	rl_check_refault_and_penalize(pfn);
+}
+
+/*
+ * External interface for workingset.c to notify refaults.
+ * This is called from workingset_refault() when a refault is detected.
+ *
+ * @folio: The folio that was faulted back in
+ */
+void rl_process_folio_refault_external(struct folio *folio)
+{
+	rl_process_folio_refault(folio);
+}
+
+/*
+ * Apply reward for successful eviction (page not refaulted within window).
+ * This is called periodically or when entries age out of PEcH table.
+ * Note: We primarily use negative reinforcement, so this is optional.
+ */
+static void rl_reward_successful_eviction(enum rl_policy_type policy)
+{
+	if (unlikely(!rl_mm_enabled))
+		return;
+
+	rl_adjust_policy_score(policy, RL_REWARD_AMOUNT);
+}
+
+/*
+ * Policy behavior modifiers for the RL agent.
+ * These affect how the eviction logic behaves based on selected policy.
+ */
+
+/*
+ * Check if we should give more weight to referenced bit.
+ * Clock policy checks referenced bit more aggressively.
+ */
+static inline bool rl_policy_check_referenced_aggressively(void)
+{
+	return rl_get_current_policy() == RL_POLICY_CLOCK;
+}
+
+/*
+ * Check if we should consider access patterns.
+ * FIFO policy ignores access patterns.
+ */
+static inline bool rl_policy_consider_access_patterns(void)
+{
+	return rl_get_current_policy() != RL_POLICY_FIFO;
+}
+
+/*
+ * Get multiplier for how much to weight the referenced bit.
+ * Returns a value to scale reference checking (100 = normal).
+ */
+static inline unsigned int rl_policy_reference_weight(void)
+{
+	switch (rl_get_current_policy()) {
+	case RL_POLICY_CLOCK:
+		return 150;  /* 50% more weight on referenced bit */
+	case RL_POLICY_FIFO:
+		return 50;   /* 50% less weight on referenced bit */
+	case RL_POLICY_LRU:
+	default:
+		return 100;  /* Normal LRU behavior */
+	}
+}
+
+#ifdef CONFIG_SYSCTL
+/*
+ * Sysctl handler for enabling/disabling RL page replacement.
+ */
+static int rl_mm_enabled_sysctl_handler(const struct ctl_table *table, int write,
+					void *buffer, size_t *lenp, loff_t *ppos)
+{
+	int ret;
+
+	ret = proc_dointvec_minmax(table, write, buffer, lenp, ppos);
+	if (ret || !write)
+		return ret;
+
+	rl_debug("RL page replacement %s\n",
+		 rl_mm_enabled ? "enabled" : "disabled");
+
+	return 0;
+}
+
+static int rl_sysctl_min = 0;
+static int rl_sysctl_max = 1;
+
+static struct ctl_table rl_mm_sysctls[] = {
+	{
+		.procname	= "rl_mm_enabled",
+		.data		= &rl_mm_enabled,
+		.maxlen		= sizeof(int),
+		.mode		= 0644,
+		.proc_handler	= rl_mm_enabled_sysctl_handler,
+		.extra1		= &rl_sysctl_min,
+		.extra2		= &rl_sysctl_max,
+	},
+};
+
+static void __init rl_mm_sysctl_init(void)
+{
+	register_sysctl("vm", rl_mm_sysctls);
+}
+#else
+static inline void rl_mm_sysctl_init(void) { }
+#endif /* CONFIG_SYSCTL */
+
+#ifdef CONFIG_PROC_FS
+/*
+ * /proc/rl_page_replacement - show current RL policy statistics
+ */
+static int rl_mm_proc_show(struct seq_file *m, void *v)
+{
+	int i;
+
+	seq_puts(m, "RL Page Replacement Policy Statistics\n");
+	seq_puts(m, "=====================================\n\n");
+
+	seq_printf(m, "Status: %s\n\n", rl_mm_enabled ? "Enabled" : "Disabled");
+
+	seq_puts(m, "Policy Scores:\n");
+	for (i = 0; i < RL_POLICY_NR_TYPES; i++) {
+		seq_printf(m, "  %-8s: %d\n",
+			   rl_policy_names[i],
+			   atomic_read(&rl_pols_table[i].score));
+	}
+
+	seq_puts(m, "\nPolicy Selections:\n");
+	for (i = 0; i < RL_POLICY_NR_TYPES; i++) {
+		seq_printf(m, "  %-8s: %ld\n",
+			   rl_policy_names[i],
+			   atomic_long_read(&rl_stat_policy_selections[i]));
+	}
+
+	seq_printf(m, "\nRefaults Detected: %ld\n",
+		   atomic_long_read(&rl_stat_refaults_detected));
+	seq_printf(m, "Penalties Applied: %ld\n",
+		   atomic_long_read(&rl_stat_penalties_applied));
+
+	return 0;
+}
+
+static int rl_mm_proc_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, rl_mm_proc_show, NULL);
+}
+
+static const struct proc_ops rl_mm_proc_ops = {
+	.proc_open	= rl_mm_proc_open,
+	.proc_read	= seq_read,
+	.proc_lseek	= seq_lseek,
+	.proc_release	= single_release,
+};
+
+static void __init rl_mm_proc_init(void)
+{
+	proc_create("rl_page_replacement", 0444, NULL, &rl_mm_proc_ops);
+}
+#else
+static inline void rl_mm_proc_init(void) { }
+#endif /* CONFIG_PROC_FS */
+/* RL-PAGE-REPLACEMENT: END */
+
 struct scan_control {
 	/* How many pages shrink_list() should reclaim */
 	unsigned long nr_to_reclaim;
@@ -921,6 +1427,40 @@ static enum folio_references folio_check_references(struct folio *folio,
 
 	referenced_folio = folio_test_clear_referenced(folio);
 
+	/* RL-PAGE-REPLACEMENT: BEGIN */
+	/*
+	 * Apply RL policy-specific behavior:
+	 * - FIFO: More aggressive reclaim, less respect for references
+	 * - Clock: More protective, gives referenced pages more chances
+	 * - LRU: Standard behavior
+	 */
+	if (rl_mm_enabled) {
+		enum rl_policy_type policy = rl_get_current_policy();
+
+		if (policy == RL_POLICY_FIFO) {
+			/*
+			 * FIFO-like behavior: reclaim even if referenced,
+			 * unless multiply referenced or VM_LOCKED.
+			 */
+			if (!referenced_ptes && !referenced_folio)
+				return FOLIOREF_RECLAIM;
+			/* Single reference on FIFO still gets reclaimed */
+			if (referenced_ptes == 1 && !referenced_folio)
+				return FOLIOREF_RECLAIM_CLEAN;
+		} else if (policy == RL_POLICY_CLOCK) {
+			/*
+			 * Clock-like behavior: be more protective of
+			 * referenced pages, give them an extra chance.
+			 */
+			if (referenced_ptes || referenced_folio) {
+				folio_set_referenced(folio);
+				return FOLIOREF_KEEP;
+			}
+		}
+		/* RL_POLICY_LRU falls through to standard behavior */
+	}
+	/* RL-PAGE-REPLACEMENT: END */
+
 	if (referenced_ptes) {
 		/*
 		 * All mapped folios start out with page table
@@ -1520,6 +2060,15 @@ retry:
 
 		folio_unlock(folio);
 free_it:
+		/* RL-PAGE-REPLACEMENT: BEGIN */
+		/*
+		 * Record this eviction in the RL history table.
+		 * This allows us to detect refaults and penalize
+		 * the policy that evicted this page.
+		 */
+		rl_record_eviction(folio, rl_get_current_policy());
+		/* RL-PAGE-REPLACEMENT: END */
+
 		/*
 		 * Folio may get swapped out as a whole, need to account
 		 * all pages in it.
@@ -1979,6 +2528,15 @@ static unsigned long shrink_inactive_list(unsigned long nr_to_scan,
 	enum vm_event_item item;
 	struct pglist_data *pgdat = lruvec_pgdat(lruvec);
 	bool stalled = false;
+
+	/* RL-PAGE-REPLACEMENT: BEGIN */
+	/*
+	 * Select a replacement policy for this reclaim batch.
+	 * The RL agent uses epsilon-greedy strategy to balance
+	 * exploration vs exploitation.
+	 */
+	(void)rl_select_policy();
+	/* RL-PAGE-REPLACEMENT: END */
 
 	while (unlikely(too_many_isolated(pgdat, file, sc))) {
 		if (stalled)
@@ -5714,6 +6272,23 @@ static void lru_gen_shrink_node(struct pglist_data *pgdat, struct scan_control *
 }
 
 #endif /* CONFIG_LRU_GEN */
+
+/* RL-PAGE-REPLACEMENT: BEGIN */
+/*
+ * Initialize the RL page replacement system.
+ * This runs independently of CONFIG_LRU_GEN.
+ */
+static int __init init_rl_page_replacement(void)
+{
+	rl_mm_init();
+	rl_mm_sysctl_init();
+	rl_mm_proc_init();
+
+	pr_info("rl_mm: RL-based page replacement policy selector initialized\n");
+	return 0;
+}
+late_initcall(init_rl_page_replacement);
+/* RL-PAGE-REPLACEMENT: END */
 
 static void shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc)
 {
