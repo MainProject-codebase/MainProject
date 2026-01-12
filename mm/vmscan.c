@@ -343,6 +343,10 @@ static void rl_record_eviction(struct folio *folio, enum rl_policy_type policy)
 
 	spin_unlock_irqrestore(&rl_pech_lock, flags);
 
+	/* First eviction only - to verify build */
+	if (unlikely(rl_pech_head == 1))
+		pr_info("*** CUSTOM BUILD MARKER: First RL eviction recorded (Shiyas-v1) ***\n");
+
 	rl_debug("Recorded eviction: pfn=%lu by policy %s\n",
 		 pfn, rl_policy_names[policy]);
 }
@@ -492,8 +496,8 @@ static int rl_mm_enabled_sysctl_handler(const struct ctl_table *table, int write
 	if (ret || !write)
 		return ret;
 
-	rl_debug("RL page replacement %s\n",
-		 rl_mm_enabled ? "enabled" : "disabled");
+	pr_info("*** CUSTOM: RL-MM policy %s (Shiyas build) ***\n",
+		 rl_mm_enabled ? "ENABLED" : "DISABLED");
 
 	return 0;
 }
@@ -529,8 +533,9 @@ static int rl_mm_proc_show(struct seq_file *m, void *v)
 {
 	int i;
 
-	seq_puts(m, "RL Page Replacement Policy Statistics\n");
-	seq_puts(m, "=====================================\n\n");
+	seq_puts(m, "=== CUSTOM KERNEL BUILD: RL-MM Statistics ===\n");
+	seq_puts(m, "*** Shiyas Custom RL Page Replacement ***\n");
+	seq_puts(m, "============================================\n\n");
 
 	seq_printf(m, "Status: %s\n\n", rl_mm_enabled ? "Enabled" : "Disabled");
 
@@ -6284,7 +6289,7 @@ static int __init init_rl_page_replacement(void)
 	rl_mm_sysctl_init();
 	rl_mm_proc_init();
 
-	pr_info("rl_mm: RL-based page replacement policy selector initialized\n");
+	pr_info("*** CUSTOM BUILD *** RL-MM: Reinforcement Learning Page Replacement ACTIVE (Build: Shiyas-v1.0) ***\n");
 	return 0;
 }
 late_initcall(init_rl_page_replacement);
