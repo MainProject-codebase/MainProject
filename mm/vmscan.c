@@ -57,6 +57,8 @@
 #include <linux/rculist_nulls.h>
 #include <linux/random.h>
 #include <linux/mmu_notifier.h>
+#include <linux/proc_fs.h>
+#include <linux/seq_file.h>
 
 #include <asm/tlbflush.h>
 #include <asm/div64.h>
@@ -133,7 +135,6 @@ struct rl_policy_score {
 };
 
 static struct rl_policy_score rl_pols_table[RL_POLICY_NR_TYPES] __read_mostly;
-static DEFINE_SPINLOCK(rl_pols_lock);
 
 /*
  * Page Eviction History Table (PEcH) - fixed-size FIFO table
@@ -253,7 +254,7 @@ static enum rl_policy_type rl_get_best_policy(void)
  */
 static enum rl_policy_type rl_get_random_policy(void)
 {
-	return prandom_u32_max(RL_POLICY_NR_TYPES);
+	return get_random_u32() % RL_POLICY_NR_TYPES;
 }
 
 /*
@@ -428,19 +429,6 @@ static void rl_process_folio_refault(struct folio *folio)
 void rl_process_folio_refault_external(struct folio *folio)
 {
 	rl_process_folio_refault(folio);
-}
-
-/*
- * Apply reward for successful eviction (page not refaulted within window).
- * This is called periodically or when entries age out of PEcH table.
- * Note: We primarily use negative reinforcement, so this is optional.
- */
-static void rl_reward_successful_eviction(enum rl_policy_type policy)
-{
-	if (unlikely(!rl_mm_enabled))
-		return;
-
-	rl_adjust_policy_score(policy, RL_REWARD_AMOUNT);
 }
 
 /*
