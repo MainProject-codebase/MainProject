@@ -273,7 +273,7 @@ static enum rl_policy_type rl_select_policy(void)
 		return RL_POLICY_LRU;
 
 	/* Epsilon-greedy selection using integer arithmetic */
-	rand_val = prandom_u32_max(100);
+	rand_val = get_random_u32() % 100;
 
 	if (rand_val < RL_EXPLORATION_RATE) {
 		/* Exploration: pick random policy */
