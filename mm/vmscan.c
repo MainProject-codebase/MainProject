@@ -202,6 +202,78 @@ struct scan_control {
  */
 int vm_swappiness = 60;
 
+/* RL-PAGE-REPLACEMENT: BEGIN */
+/*
+ * Reinforcement Learning-based Page Replacement Policy Selector
+ * 
+ * This implementation uses a multi-armed bandit approach to dynamically
+ * select between existing page replacement policies based on runtime
+ * feedback from page fault penalties.
+ */
+
+/* Configuration */
+#define RL_MM_ENABLE 1			/* Enable RL policy selector */
+#define RL_NUM_POLICIES 2		/* Number of replacement policies */
+#define RL_PECH_TABLE_SIZE 1024		/* Size of eviction history table */
+#define RL_EXPLORATION_RATE 10		/* 10% exploration (0-100) */
+#define RL_SCORE_MIN -10000		/* Minimum policy score */
+#define RL_SCORE_MAX 10000		/* Maximum policy score */
+#define RL_PENALTY_VALUE 10		/* Penalty for causing a page fault */
+#define RL_REWARD_VALUE 1		/* Reward for successful eviction */
+
+/* Policy types supported by the RL agent */
+enum rl_policy_type {
+	RL_POLICY_LRU = 0,		/* Least Recently Used */
+	RL_POLICY_MRU = 1,		/* Most Recently Used */
+};
+
+/* Policy Score Table (PolS) - tracks performance of each policy */
+struct rl_policy_score {
+	enum rl_policy_type policy;	/* Policy identifier */
+	int score;			/* Current score (bounded) */
+	unsigned long evictions;	/* Total evictions by this policy */
+	unsigned long faults;		/* Page faults caused by this policy */
+};
+
+/* Page Eviction History Table (PEcH) - FIFO circular buffer */
+struct rl_eviction_history {
+	pid_t pid;			/* Process ID that owned the page */
+	unsigned long pfn;		/* Page frame number */
+	unsigned long vaddr;		/* Virtual address */
+	enum rl_policy_type evicted_by;	/* Policy that evicted this page */
+	unsigned long timestamp;	/* Eviction timestamp (jiffies) */
+	bool valid;			/* Entry is valid */
+};
+
+/* Global RL data structures */
+static struct rl_policy_score rl_pols_table[RL_NUM_POLICIES] __cacheline_aligned_in_smp = {
+	[RL_POLICY_LRU] = {
+		.policy = RL_POLICY_LRU,
+		.score = 0,
+		.evictions = 0,
+		.faults = 0,
+	},
+	[RL_POLICY_MRU] = {
+		.policy = RL_POLICY_MRU,
+		.score = 0,
+		.evictions = 0,
+		.faults = 0,
+	},
+};
+
+static struct rl_eviction_history rl_pech_table[RL_PECH_TABLE_SIZE] __read_mostly;
+static unsigned int rl_pech_head;	/* Next insert position (FIFO) */
+static DEFINE_SPINLOCK(rl_pols_lock);	/* Protects PolS table */
+static DEFINE_SPINLOCK(rl_pech_lock);	/* Protects PEcH table */
+
+#ifdef CONFIG_RL_MM_DEBUG
+static unsigned long rl_total_decisions;
+static unsigned long rl_explorations;
+static unsigned long rl_exploitations;
+#endif
+
+/* RL-PAGE-REPLACEMENT: END */
+
 #ifdef CONFIG_MEMCG
 
 /* Returns true for reclaim through cgroup limits or cgroup interfaces. */
