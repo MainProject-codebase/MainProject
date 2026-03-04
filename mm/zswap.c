@@ -1168,6 +1168,7 @@ static enum lru_status shrink_memcg_cb(struct list_head *item, struct list_lru_o
 	if (entry->referenced) {
 		entry->referenced = false;
 		/* MRU: reclaim the most recently used page */
+		pr_info("MRU reclaim triggered\n");
 		return LRU_REMOVED_RETRY;
 
 	}
