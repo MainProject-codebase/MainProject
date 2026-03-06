@@ -71,6 +71,329 @@
 #define CREATE_TRACE_POINTS
 #include <trace/events/vmscan.h>
 
+/* RL-PAGE-REPLACEMENT: BEGIN */
+
+/*
+ * RL-Based Page Replacement Policy Selector
+ * Following design from "Virtual Memory Page Replacement using Reinforcement Learning"
+ */
+
+/* Enable debug logging - comment out for production */
+/* #define CONFIG_RL_MM_DEBUG */
+
+/*
+ * Policy types supported by the RL agent
+ * The agent selects among these existing kernel policies
+ */
+enum policy_type {
+	POLICY_LRU = 0,     /* Least Recently Used (evict oldest access) */
+	POLICY_MRU,         /* Most Recently Used (evict newest access) */
+	POLICY_MAX          /* Number of policies (must be last) */
+};
+
+/*
+ * Policy Score Table (PolS) Entry
+ * Tracks the performance score of each replacement policy
+ */
+struct policy_score {
+	enum policy_type policy;
+	int score;
+};
+
+/*
+ * Page Eviction History (PEcH) Table Entry
+ * Records pages that were recently evicted to detect re-references
+ */
+struct eviction_history {
+	pid_t pid;                      /* Process ID that owned the page */
+	unsigned long page_id;          /* Page frame number or hash */
+	unsigned long vaddr;            /* Virtual address of the page */
+	enum policy_type evicted_by;    /* Policy that evicted this page */
+	unsigned long timestamp;        /* Jiffies when evicted */
+	int valid;                      /* Entry is valid (1) or empty (0) */
+};
+
+/*
+ * RL-based Page Replacement Configuration
+ */
+#define RL_PECH_HASH_BUCKETS 128     /* Number of hash buckets */
+#define RL_PECH_BUCKET_SIZE 4        /* Entries per bucket */
+#define RL_PECH_TABLE_SIZE (RL_PECH_HASH_BUCKETS * RL_PECH_BUCKET_SIZE) /* 512 total entries */
+#define RL_EXPLORATION_RATE 20       /* Exploration probability (out of 100) */
+#define RL_SCORE_PENALTY -10         /* Score decrease on page re-fault */
+#define RL_INITIAL_SCORE 100         /* Initial score for each policy */
+#define RL_MIN_SCORE -1000           /* Minimum allowed score */
+#define RL_MAX_SCORE 10000           /* Maximum allowed score */
+
+/*
+ * Policy Score Table (PolS)
+ * One entry per policy - tracks cumulative performance
+ */
+static struct policy_score pols_table[POLICY_MAX] __read_mostly;
+
+/*
+ * Page Eviction History Table (PEcH)
+ * Hash table with chaining - each bucket has fixed entries
+ * Hash function: (pid ^ page_id) % RL_PECH_HASH_BUCKETS
+ * Collision handling: LRU replacement within bucket
+ */
+static struct eviction_history pech_table[RL_PECH_HASH_BUCKETS][RL_PECH_BUCKET_SIZE];
+static DEFINE_SPINLOCK(pech_lock);  /* Protects PEcH table */
+static DEFINE_SPINLOCK(pols_lock);  /* Protects PolS table */
+
+/*
+ * RL agent enabled flag
+ * Can be toggled via sysctl or kept static
+ */
+static int rl_page_replacement_enabled __read_mostly = 1;
+
+/*
+ * Initialize the PolS table with default scores
+ */
+static void __init init_pols_table(void)
+{
+	int i;
+
+	for (i = 0; i < POLICY_MAX; i++) {
+		pols_table[i].policy = i;
+		pols_table[i].score = RL_INITIAL_SCORE;
+	}
+
+#ifdef CONFIG_RL_MM_DEBUG
+	pr_debug("RL-MM: PolS table initialized with %d policies\n", POLICY_MAX);
+#endif
+}
+
+/*
+ * Hash function for PEcH table
+ * Combines pid and page_id for distribution
+ */
+static inline unsigned int pech_hash(pid_t pid, unsigned long page_id)
+{
+	return (unsigned int)((pid ^ page_id ^ (page_id >> 16)) % RL_PECH_HASH_BUCKETS);
+}
+
+/*
+ * Initialize the PEcH table to empty state
+ */
+static void __init init_pech_table(void)
+{
+	int i, j;
+
+	for (i = 0; i < RL_PECH_HASH_BUCKETS; i++) {
+		for (j = 0; j < RL_PECH_BUCKET_SIZE; j++) {
+			pech_table[i][j].valid = 0;
+			pech_table[i][j].pid = 0;
+			pech_table[i][j].page_id = 0;
+			pech_table[i][j].vaddr = 0;
+			pech_table[i][j].evicted_by = POLICY_LRU;
+			pech_table[i][j].timestamp = 0;
+		}
+	}
+
+#ifdef CONFIG_RL_MM_DEBUG
+	pr_debug("RL-MM: PEcH hash table initialized (%d buckets × %d entries = %d total)\n",
+		 RL_PECH_HASH_BUCKETS, RL_PECH_BUCKET_SIZE, RL_PECH_TABLE_SIZE);
+#endif
+}
+
+/*
+ * Add or update an entry in the PEcH hash table
+ * O(BUCKET_SIZE) lookup - typically O(4) instead of O(512)
+ * Uses LRU replacement within bucket when full
+ */
+static void pech_add_entry(pid_t pid, unsigned long page_id, 
+			   unsigned long vaddr, enum policy_type policy)
+{
+	unsigned long flags;
+	unsigned int bucket;
+	int i;
+	int found = -1;
+	int lru_idx = 0;
+	unsigned long oldest_time = ULONG_MAX;
+
+	bucket = pech_hash(pid, page_id);
+
+	spin_lock_irqsave(&pech_lock, flags);
+
+	/* Search only within the hashed bucket - O(4) instead of O(512) */
+	for (i = 0; i < RL_PECH_BUCKET_SIZE; i++) {
+		if (pech_table[bucket][i].valid &&
+		    pech_table[bucket][i].pid == pid &&
+		    pech_table[bucket][i].page_id == page_id) {
+			found = i;
+			break;
+		}
+		/* Track oldest entry for LRU replacement */
+		if (!pech_table[bucket][i].valid) {
+			lru_idx = i;
+			oldest_time = 0;  /* Empty slot - use it first */
+		} else if (pech_table[bucket][i].timestamp < oldest_time) {
+			oldest_time = pech_table[bucket][i].timestamp;
+			lru_idx = i;
+		}
+	}
+
+	if (found >= 0) {
+		/* Refresh existing entry */
+		pech_table[bucket][found].vaddr = vaddr;
+		pech_table[bucket][found].evicted_by = policy;
+		pech_table[bucket][found].timestamp = jiffies;
+	} else {
+		/* Add new entry, replacing LRU entry in bucket */
+		pech_table[bucket][lru_idx].valid = 1;
+		pech_table[bucket][lru_idx].pid = pid;
+		pech_table[bucket][lru_idx].page_id = page_id;
+		pech_table[bucket][lru_idx].vaddr = vaddr;
+		pech_table[bucket][lru_idx].evicted_by = policy;
+		pech_table[bucket][lru_idx].timestamp = jiffies;
+	}
+
+	spin_unlock_irqrestore(&pech_lock, flags);
+
+#ifdef CONFIG_RL_MM_DEBUG
+	trace_printk("RL-MM: PEcH entry added - bucket=%u, pid=%d, page=%lx, policy=%d\n",
+		     bucket, pid, page_id, policy);
+#endif
+}
+
+/*
+ * Check if a page exists in the PEcH hash table
+ * O(BUCKET_SIZE) lookup - typically O(4) instead of O(512)
+ * Returns the policy that evicted it, or -1 if not found
+ */
+static int pech_lookup(pid_t pid, unsigned long page_id)
+{
+	unsigned long flags;
+	unsigned int bucket;
+	int i;
+	int policy = -1;
+
+	bucket = pech_hash(pid, page_id);
+
+	spin_lock_irqsave(&pech_lock, flags);
+
+	/* Search only within the hashed bucket - O(4) instead of O(512) */
+	for (i = 0; i < RL_PECH_BUCKET_SIZE; i++) {
+		if (pech_table[bucket][i].valid &&
+		    pech_table[bucket][i].pid == pid &&
+		    pech_table[bucket][i].page_id == page_id) {
+			policy = pech_table[bucket][i].evicted_by;
+			/* Invalidate entry after lookup to avoid double-penalty */
+			pech_table[bucket][i].valid = 0;
+			break;
+		}
+	}
+
+	spin_unlock_irqrestore(&pech_lock, flags);
+
+	return policy;
+}
+
+/*
+ * Update policy score (with bounds checking)
+ */
+static void pols_update_score(enum policy_type policy, int delta)
+{
+	unsigned long flags;
+
+	if (policy >= POLICY_MAX)
+		return;
+
+	spin_lock_irqsave(&pols_lock, flags);
+
+	pols_table[policy].score += delta;
+
+	/* Enforce bounds */
+	if (pols_table[policy].score < RL_MIN_SCORE)
+		pols_table[policy].score = RL_MIN_SCORE;
+	if (pols_table[policy].score > RL_MAX_SCORE)
+		pols_table[policy].score = RL_MAX_SCORE;
+
+	spin_unlock_irqrestore(&pols_lock, flags);
+
+#ifdef CONFIG_RL_MM_DEBUG
+	trace_printk("RL-MM: Policy %d score updated by %d to %d\n",
+		     policy, delta, pols_table[policy].score);
+#endif
+}
+
+/*
+ * Select a policy using epsilon-greedy exploration
+ * Returns the policy to use for the next eviction
+ */
+static enum policy_type rl_select_policy(void)
+{
+	unsigned long flags;
+	enum policy_type selected;
+	u32 rand_val;
+	int i;
+	int best_idx = 0;
+	int best_score;
+
+	if (!rl_page_replacement_enabled)
+		return POLICY_LRU; /* Default to LRU when RL disabled */
+
+	/* Epsilon-greedy: explore vs exploit */
+	rand_val = prandom_u32() % 100;
+
+	if (rand_val < RL_EXPLORATION_RATE) {
+		/* Explore: choose random policy */
+		selected = prandom_u32() % POLICY_MAX;
+
+#ifdef CONFIG_RL_MM_DEBUG
+		trace_printk("RL-MM: Exploring - selected policy %d\n", selected);
+#endif
+	} else {
+		/* Exploit: choose best policy */
+		spin_lock_irqsave(&pols_lock, flags);
+
+		best_score = pols_table[0].score;
+		for (i = 1; i < POLICY_MAX; i++) {
+			if (pols_table[i].score > best_score) {
+				best_score = pols_table[i].score;
+				best_idx = i;
+			}
+		}
+		selected = pols_table[best_idx].policy;
+
+		spin_unlock_irqrestore(&pols_lock, flags);
+
+#ifdef CONFIG_RL_MM_DEBUG
+		trace_printk("RL-MM: Exploiting - selected policy %d (score=%d)\n",
+			     selected, best_score);
+#endif
+	}
+
+	return selected;
+}
+
+/*
+ * Handle page fault - check if faulting page was recently evicted
+ * If so, penalize the policy that evicted it
+ */
+static void rl_handle_page_fault(pid_t pid, unsigned long page_id)
+{
+	int evicted_by_policy;
+
+	if (!rl_page_replacement_enabled)
+		return;
+
+	evicted_by_policy = pech_lookup(pid, page_id);
+
+	if (evicted_by_policy >= 0 && evicted_by_policy < POLICY_MAX) {
+		/* Page was recently evicted - penalize that policy */
+		pols_update_score(evicted_by_policy, RL_SCORE_PENALTY);
+
+#ifdef CONFIG_RL_MM_DEBUG
+		pr_debug("RL-MM: Page fault on recently evicted page - penalizing policy %d\n",
+			 evicted_by_policy);
+#endif
+	}
+}
+
+/* RL-PAGE-REPLACEMENT: END */
+
 struct scan_control {
 	/* How many pages shrink_list() should reclaim */
 	unsigned long nr_to_reclaim;
@@ -201,78 +524,6 @@ struct scan_control {
  * From 0 .. MAX_SWAPPINESS.  Higher means more swappy.
  */
 int vm_swappiness = 60;
-
-/* RL-PAGE-REPLACEMENT: BEGIN */
-/*
- * Reinforcement Learning-based Page Replacement Policy Selector
- * 
- * This implementation uses a multi-armed bandit approach to dynamically
- * select between existing page replacement policies based on runtime
- * feedback from page fault penalties.
- */
-
-/* Configuration */
-#define RL_MM_ENABLE 1			/* Enable RL policy selector */
-#define RL_NUM_POLICIES 2		/* Number of replacement policies */
-#define RL_PECH_TABLE_SIZE 1024		/* Size of eviction history table */
-#define RL_EXPLORATION_RATE 10		/* 10% exploration (0-100) */
-#define RL_SCORE_MIN -10000		/* Minimum policy score */
-#define RL_SCORE_MAX 10000		/* Maximum policy score */
-#define RL_PENALTY_VALUE 10		/* Penalty for causing a page fault */
-#define RL_REWARD_VALUE 1		/* Reward for successful eviction */
-
-/* Policy types supported by the RL agent */
-enum rl_policy_type {
-	RL_POLICY_LRU = 0,		/* Least Recently Used */
-	RL_POLICY_MRU = 1,		/* Most Recently Used */
-};
-
-/* Policy Score Table (PolS) - tracks performance of each policy */
-struct rl_policy_score {
-	enum rl_policy_type policy;	/* Policy identifier */
-	int score;			/* Current score (bounded) */
-	unsigned long evictions;	/* Total evictions by this policy */
-	unsigned long faults;		/* Page faults caused by this policy */
-};
-
-/* Page Eviction History Table (PEcH) - FIFO circular buffer */
-struct rl_eviction_history {
-	pid_t pid;			/* Process ID that owned the page */
-	unsigned long pfn;		/* Page frame number */
-	unsigned long vaddr;		/* Virtual address */
-	enum rl_policy_type evicted_by;	/* Policy that evicted this page */
-	unsigned long timestamp;	/* Eviction timestamp (jiffies) */
-	bool valid;			/* Entry is valid */
-};
-
-/* Global RL data structures */
-static struct rl_policy_score rl_pols_table[RL_NUM_POLICIES] __cacheline_aligned_in_smp = {
-	[RL_POLICY_LRU] = {
-		.policy = RL_POLICY_LRU,
-		.score = 0,
-		.evictions = 0,
-		.faults = 0,
-	},
-	[RL_POLICY_MRU] = {
-		.policy = RL_POLICY_MRU,
-		.score = 0,
-		.evictions = 0,
-		.faults = 0,
-	},
-};
-
-static struct rl_eviction_history rl_pech_table[RL_PECH_TABLE_SIZE] __read_mostly;
-static unsigned int rl_pech_head;	/* Next insert position (FIFO) */
-static DEFINE_SPINLOCK(rl_pols_lock);	/* Protects PolS table */
-static DEFINE_SPINLOCK(rl_pech_lock);	/* Protects PEcH table */
-
-#ifdef CONFIG_RL_MM_DEBUG
-static unsigned long rl_total_decisions;
-static unsigned long rl_explorations;
-static unsigned long rl_exploitations;
-#endif
-
-/* RL-PAGE-REPLACEMENT: END */
 
 #ifdef CONFIG_MEMCG
 
@@ -7494,6 +7745,14 @@ void __meminit kswapd_stop(int nid)
 static int __init kswapd_init(void)
 {
 	int nid;
+
+	/* RL-PAGE-REPLACEMENT: BEGIN */
+	/* Initialize RL-based page replacement tables */
+	init_pols_table();
+	init_pech_table();
+	pr_info("RL-based page replacement initialized (enabled=%d)\n", 
+		rl_page_replacement_enabled);
+	/* RL-PAGE-REPLACEMENT: END */
 
 	swap_setup();
 	for_each_node_state(nid, N_MEMORY)
