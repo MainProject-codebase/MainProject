@@ -335,11 +335,11 @@ static enum policy_type rl_select_policy(void)
 		return POLICY_LRU; /* Default to LRU when RL disabled */
 
 	/* Epsilon-greedy: explore vs exploit */
-	rand_val = prandom_u32() % 100;
+	rand_val = get_random_u32_below(100);
 
 	if (rand_val < RL_EXPLORATION_RATE) {
 		/* Explore: choose random policy */
-		selected = prandom_u32() % POLICY_MAX;
+		selected = get_random_u32_below(POLICY_MAX);
 
 #ifdef CONFIG_RL_MM_DEBUG
 		trace_printk("RL-MM: Exploring - selected policy %d\n", selected);
