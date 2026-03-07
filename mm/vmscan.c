@@ -57,6 +57,8 @@
 #include <linux/rculist_nulls.h>
 #include <linux/random.h>
 #include <linux/mmu_notifier.h>
+#include <linux/proc_fs.h>
+#include <linux/seq_file.h>
 
 #include <asm/tlbflush.h>
 #include <asm/div64.h>
@@ -372,7 +374,7 @@ static enum policy_type rl_select_policy(void)
  * Handle page fault - check if faulting page was recently evicted
  * If so, penalize the policy that evicted it
  */
-static void rl_handle_page_fault(pid_t pid, unsigned long page_id)
+void rl_handle_page_fault(pid_t pid, unsigned long page_id)
 {
 	int evicted_by_policy;
 
@@ -390,6 +392,99 @@ static void rl_handle_page_fault(pid_t pid, unsigned long page_id)
 			 evicted_by_policy);
 #endif
 	}
+}
+
+/*
+ * /proc interface for userspace visibility of RL state
+ */
+static int rl_mm_stats_show(struct seq_file *m, void *v)
+{
+	unsigned long flags;
+	int i, j, bucket;
+	int valid_entries = 0;
+
+	seq_printf(m, "RL-Based Page Replacement Statistics\n");
+	seq_printf(m, "=====================================\n\n");
+
+	/* Show policy scores */
+	seq_printf(m, "Policy Scores:\n");
+	spin_lock_irqsave(&pols_lock, flags);
+	for (i = 0; i < POLICY_MAX; i++) {
+		const char *policy_name = (i == POLICY_LRU) ? "LRU" : "MRU";
+		seq_printf(m, "  %s: %d\n", policy_name, pols_table[i].score);
+	}
+	spin_unlock_irqrestore(&pols_lock, flags);
+
+	/* Show PEcH table statistics */
+	seq_printf(m, "\nPage Eviction History Table:\n");
+	seq_printf(m, "  Total capacity: %d entries (%d buckets × %d)\n",
+		   RL_PECH_TABLE_SIZE, RL_PECH_HASH_BUCKETS, RL_PECH_BUCKET_SIZE);
+
+	spin_lock_irqsave(&pech_lock, flags);
+	for (bucket = 0; bucket < RL_PECH_HASH_BUCKETS; bucket++) {
+		for (j = 0; j < RL_PECH_BUCKET_SIZE; j++) {
+			if (pech_table[bucket][j].valid)
+				valid_entries++;
+		}
+	}
+	spin_unlock_irqrestore(&pech_lock, flags);
+
+	seq_printf(m, "  Valid entries: %d (%.1f%% full)\n",
+		   valid_entries, (valid_entries * 100.0) / RL_PECH_TABLE_SIZE);
+
+	/* Show sample of recent evictions */
+	seq_printf(m, "\nRecent Evictions (sample):\n");
+	seq_printf(m, "  Bucket  PID        PageID      VAddr       Policy    Age(jiffies)\n");
+	
+	spin_lock_irqsave(&pech_lock, flags);
+	{
+		int shown = 0;
+		for (bucket = 0; bucket < RL_PECH_HASH_BUCKETS && shown < 20; bucket++) {
+			for (j = 0; j < RL_PECH_BUCKET_SIZE && shown < 20; j++) {
+				if (pech_table[bucket][j].valid) {
+					const char *policy_name = 
+						(pech_table[bucket][j].evicted_by == POLICY_LRU) ? "LRU" : "MRU";
+					seq_printf(m, "  %-7d %-10d 0x%08lx  0x%08lx  %-8s  %lu\n",
+						   bucket,
+						   pech_table[bucket][j].pid,
+						   pech_table[bucket][j].page_id,
+						   pech_table[bucket][j].vaddr,
+						   policy_name,
+						   jiffies - pech_table[bucket][j].timestamp);
+					shown++;
+				}
+			}
+		}
+	}
+	spin_unlock_irqrestore(&pech_lock, flags);
+
+	seq_printf(m, "\nConfiguration:\n");
+	seq_printf(m, "  Enabled: %s\n", rl_page_replacement_enabled ? "Yes" : "No");
+	seq_printf(m, "  Exploration rate: %d%%\n", RL_EXPLORATION_RATE);
+	seq_printf(m, "  Score penalty: %d\n", RL_SCORE_PENALTY);
+	seq_printf(m, "  Score range: [%d, %d]\n", RL_MIN_SCORE, RL_MAX_SCORE);
+
+	return 0;
+}
+
+static int rl_mm_stats_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, rl_mm_stats_show, NULL);
+}
+
+static const struct proc_ops rl_mm_stats_proc_ops = {
+	.proc_open	= rl_mm_stats_open,
+	.proc_read	= seq_read,
+	.proc_lseek	= seq_lseek,
+	.proc_release	= single_release,
+};
+
+static void __init rl_create_proc_interface(void)
+{
+	proc_create("rl_mm_stats", 0444, NULL, &rl_mm_stats_proc_ops);
+#ifdef CONFIG_RL_MM_DEBUG
+	pr_debug("RL-MM: Created /proc/rl_mm_stats interface\n");
+#endif
 }
 
 /* RL-PAGE-REPLACEMENT: END */
@@ -1414,6 +1509,9 @@ static unsigned int shrink_folio_list(struct list_head *folio_list,
 	bool do_demote_pass;
 	struct swap_iocb *plug = NULL;
 
+	/* RL-PAGE-REPLACEMENT: Select policy for this reclaim batch */
+	enum policy_type selected_policy = rl_select_policy();
+
 	folio_batch_init(&free_folios);
 	memset(stat, 0, sizeof(*stat));
 	cond_resched();
@@ -1848,6 +1946,21 @@ free_it:
 		 * all pages in it.
 		 */
 		nr_reclaimed += nr_pages;
+
+		/* RL-PAGE-REPLACEMENT: Record eviction in PEcH table */
+		if (rl_page_replacement_enabled) {
+			pid_t pid = 0;
+			unsigned long vaddr = 0;
+			if (current && current->mm) {
+				pid = current->pid;
+			}
+			vaddr = folio_pfn(folio) << PAGE_SHIFT;
+			pech_add_entry(pid, folio_pfn(folio), vaddr, selected_policy);
+#ifdef CONFIG_RL_MM_DEBUG
+			trace_printk("RL-MM: Evicted folio pfn=%lx by policy %d\n",
+				     folio_pfn(folio), selected_policy);
+#endif
+		}
 
 		folio_unqueue_deferred_split(folio);
 		if (folio_batch_add(&free_folios, folio) == 0) {
@@ -7750,6 +7863,7 @@ static int __init kswapd_init(void)
 	/* Initialize RL-based page replacement tables */
 	init_pols_table();
 	init_pech_table();
+	rl_create_proc_interface();
 	pr_info("RL-based page replacement initialized (enabled=%d)\n", 
 		rl_page_replacement_enabled);
 	/* RL-PAGE-REPLACEMENT: END */

@@ -90,6 +90,10 @@
 #include "internal.h"
 #include "swap.h"
 
+/* RL-PAGE-REPLACEMENT: External declarations */
+extern void rl_handle_page_fault(pid_t pid, unsigned long page_id);
+extern int rl_page_replacement_enabled;
+
 #if defined(LAST_CPUPID_NOT_IN_PAGE_FLAGS) && !defined(CONFIG_COMPILE_TEST)
 #warning Unfortunate NUMA and NUMA Balancing config, growing page-frame for last_cpupid.
 #endif
@@ -4691,6 +4695,10 @@ check_folio:
 		  (pte_write(pte) && !PageAnonExclusive(page)));
 	set_ptes(vma->vm_mm, address, ptep, pte, nr_pages);
 	arch_do_swap_page_nr(vma->vm_mm, vma, address, pte, pte, nr_pages);
+
+	/* RL-PAGE-REPLACEMENT: Notify RL agent of page fault */
+	if (rl_page_replacement_enabled && current && current->mm)
+		rl_handle_page_fault(current->pid, folio_pfn(folio));
 
 	folio_unlock(folio);
 	if (folio != swapcache && swapcache) {
