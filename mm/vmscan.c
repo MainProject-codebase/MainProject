@@ -147,7 +147,7 @@ static DEFINE_SPINLOCK(pols_lock);  /* Protects PolS table */
  * RL agent enabled flag
  * Can be toggled via sysctl or kept static
  */
-static int rl_page_replacement_enabled __read_mostly = 1;
+int rl_page_replacement_enabled __read_mostly = 1;
 
 /*
  * Initialize the PolS table with default scores
@@ -373,6 +373,7 @@ static enum policy_type rl_select_policy(void)
 /*
  * Handle page fault - check if faulting page was recently evicted
  * If so, penalize the policy that evicted it
+ * Exported for use by mm/memory.c
  */
 void rl_handle_page_fault(pid_t pid, unsigned long page_id)
 {
@@ -429,8 +430,8 @@ static int rl_mm_stats_show(struct seq_file *m, void *v)
 	}
 	spin_unlock_irqrestore(&pech_lock, flags);
 
-	seq_printf(m, "  Valid entries: %d (%.1f%% full)\n",
-		   valid_entries, (valid_entries * 100.0) / RL_PECH_TABLE_SIZE);
+	seq_printf(m, "  Valid entries: %d (%d%% full)\n",
+		   valid_entries, (valid_entries * 100) / RL_PECH_TABLE_SIZE);
 
 	/* Show sample of recent evictions */
 	seq_printf(m, "\nRecent Evictions (sample):\n");

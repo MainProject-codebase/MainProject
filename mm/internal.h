@@ -471,6 +471,8 @@ extern unsigned long highest_memmap_pfn;
 bool folio_isolate_lru(struct folio *folio);
 void folio_putback_lru(struct folio *folio);
 extern void reclaim_throttle(pg_data_t *pgdat, enum vmscan_throttle_state reason);
+extern void rl_handle_page_fault(pid_t pid, unsigned long page_id);
+extern int rl_page_replacement_enabled;
 
 /*
  * in mm/rmap.c:
