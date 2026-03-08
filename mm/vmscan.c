@@ -2449,7 +2449,12 @@ static unsigned long shrink_inactive_list(unsigned long nr_to_scan,
 	if (nr_taken == 0)
 		return 0;
 
-	nr_reclaimed = shrink_folio_list(&folio_list, pgdat, sc, &stat, false);
+	/* RL-PAGE-REPLACEMENT: Pure LRU - ignore reference bits in inactive list
+	 * OLD CODE (clock/second-chance algorithm):
+	 * nr_reclaimed = shrink_folio_list(&folio_list, pgdat, sc, &stat, false);
+	 * NEW CODE (pure LRU - age-based eviction):
+	 */
+	nr_reclaimed = shrink_folio_list(&folio_list, pgdat, sc, &stat, true);
 
 	spin_lock_irq(&lruvec->lru_lock);
 	move_folios_to_lru(lruvec, &folio_list);
@@ -2574,24 +2579,32 @@ static void shrink_active_list(unsigned long nr_to_scan,
 			}
 		}
 
-		/* Referenced or rmap lock contention: rotate */
-		if (folio_referenced(folio, 0, sc->target_mem_cgroup,
-				     &vm_flags) != 0) {
-			/*
-			 * Identify referenced, file-backed active folios and
-			 * give them one more trip around the active list. So
-			 * that executable code get better chances to stay in
-			 * memory under moderate memory pressure.  Anon folios
-			 * are not likely to be evicted by use-once streaming
-			 * IO, plus JVM can create lots of anon VM_EXEC folios,
-			 * so we ignore them here.
-			 */
-			if ((vm_flags & VM_EXEC) && folio_is_file_lru(folio)) {
-				nr_rotated += folio_nr_pages(folio);
-				list_add(&folio->lru, &l_active);
-				continue;
-			}
-		}
+		/* RL-PAGE-REPLACEMENT: Pure LRU - skip reference checking
+		 * Old code checked folio_referenced() and rotated pages on active list.
+		 * For pure LRU, we demote all pages from active→inactive based on age.
+		 */
+
+		/* OLD CODE - COMMENTED OUT (clock algorithm):
+		 *
+		 * // Referenced or rmap lock contention: rotate
+		 * if (folio_referenced(folio, 0, sc->target_mem_cgroup,
+		 *		     &vm_flags) != 0) {
+		 *	//
+		 *	// Identify referenced, file-backed active folios and
+		 *	// give them one more trip around the active list. So
+		 *	// that executable code get better chances to stay in
+		 *	// memory under moderate memory pressure.  Anon folios
+		 *	// are not likely to be evicted by use-once streaming
+		 *	// IO, plus JVM can create lots of anon VM_EXEC folios,
+		 *	// so we ignore them here.
+		 *	//
+		 *	if ((vm_flags & VM_EXEC) && folio_is_file_lru(folio)) {
+		 *		nr_rotated += folio_nr_pages(folio);
+		 *		list_add(&folio->lru, &l_active);
+		 *		continue;
+		 *	}
+		 * }
+		 */
 
 		folio_clear_active(folio);	/* we are de-activating */
 		folio_set_workingset(folio);
@@ -5109,7 +5122,12 @@ static int evict_folios(struct lruvec *lruvec, struct scan_control *sc, int swap
 	if (list_empty(&list))
 		return scanned;
 retry:
-	reclaimed = shrink_folio_list(&list, pgdat, sc, &stat, false);
+	/* RL-PAGE-REPLACEMENT: Pure LRU - ignore reference bits (LRU_GEN path)
+	 * OLD CODE (clock/second-chance algorithm):
+	 * reclaimed = shrink_folio_list(&list, pgdat, sc, &stat, false);
+	 * NEW CODE (pure LRU - age-based eviction):
+	 */
+	reclaimed = shrink_folio_list(&list, pgdat, sc, &stat, true);
 	sc->nr.unqueued_dirty += stat.nr_unqueued_dirty;
 	sc->nr_reclaimed += reclaimed;
 	trace_mm_vmscan_lru_shrink_inactive(pgdat->node_id,
