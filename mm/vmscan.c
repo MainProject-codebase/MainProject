@@ -2154,7 +2154,12 @@ static unsigned long isolate_lru_folios(unsigned long nr_to_scan,
 		struct list_head *move_to = src;
 		struct folio *folio;
 
-		folio = lru_to_folio(src);
+		/* MRU IMPLEMENTATION: Pick from HEAD (most recently used) instead of TAIL (least recently used)
+		 * Pages are added to list HEAD via list_add() in lruvec_add_folio()
+		 * HEAD = newest, TAIL = oldest
+		 * OLD LRU CODE: folio = lru_to_folio(src);  // Gets from TAIL (head->prev) - oldest pages 
+		 */
+		folio = list_first_entry(src, struct folio, lru);  /* MRU: Get from HEAD (head->next) - newest */
 		prefetchw_prev_lru_folio(folio, src, flags);
 
 		nr_pages = folio_nr_pages(folio);
