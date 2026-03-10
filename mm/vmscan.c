@@ -582,6 +582,9 @@ struct scan_control {
 	/* This context's GFP mask */
 	gfp_t gfp_mask;
 
+	/* RL-PAGE-REPLACEMENT: Selected eviction policy for this reclaim cycle */
+	enum policy_type selected_policy;
+
 	/* Incremented by the number of inactive pages that were scanned */
 	unsigned long nr_scanned;
 
@@ -1510,8 +1513,8 @@ static unsigned int shrink_folio_list(struct list_head *folio_list,
 	bool do_demote_pass;
 	struct swap_iocb *plug = NULL;
 
-	/* RL-PAGE-REPLACEMENT: Select policy for this reclaim batch */
-	enum policy_type selected_policy = rl_select_policy();
+	/* RL-PAGE-REPLACEMENT: Use policy selected during isolation */
+	enum policy_type selected_policy = sc->selected_policy;
 
 	folio_batch_init(&free_folios);
 	memset(stat, 0, sizeof(*stat));
@@ -2137,7 +2140,7 @@ static __always_inline void update_lru_sizes(struct lruvec *lruvec,
 static unsigned long isolate_lru_folios(unsigned long nr_to_scan,
 		struct lruvec *lruvec, struct list_head *dst,
 		unsigned long *nr_scanned, struct scan_control *sc,
-		enum lru_list lru)
+		enum lru_list lru, enum policy_type policy)
 {
 	struct list_head *src = &lruvec->lists[lru];
 	unsigned long nr_taken = 0;
@@ -2154,12 +2157,21 @@ static unsigned long isolate_lru_folios(unsigned long nr_to_scan,
 		struct list_head *move_to = src;
 		struct folio *folio;
 
-		/* MRU IMPLEMENTATION: Pick from HEAD (most recently used) instead of TAIL (least recently used)
-		 * Pages are added to list HEAD via list_add() in lruvec_add_folio()
-		 * HEAD = newest, TAIL = oldest
-		 * OLD LRU CODE: folio = lru_to_folio(src);  // Gets from TAIL (head->prev) - oldest pages 
+		/* RL-BASED POLICY SWITCHING: Select page based on chosen policy
+		 * POLICY_LRU: Evict from TAIL (oldest pages first)
+		 * POLICY_MRU: Evict from HEAD (newest pages first)
+		 * 
+		 * List structure:
+		 *   - Pages added via list_add() to HEAD when accessed
+		 *   - HEAD (head->next) = newest, TAIL (head->prev) = oldest
 		 */
-		folio = list_first_entry(src, struct folio, lru);  /* MRU: Get from HEAD (head->next) - newest */
+		if (policy == POLICY_LRU) {
+			/* LRU: Get from TAIL (oldest pages) */
+			folio = lru_to_folio(src);  /* lru_to_folio() = list_entry(head->prev) */
+		} else {
+			/* MRU: Get from HEAD (newest pages) */
+			folio = list_first_entry(src, struct folio, lru);  /* list_entry(head->next) */
+		}
 		prefetchw_prev_lru_folio(folio, src, flags);
 
 		nr_pages = folio_nr_pages(folio);
@@ -2439,8 +2451,10 @@ static unsigned long shrink_inactive_list(unsigned long nr_to_scan,
 
 	spin_lock_irq(&lruvec->lru_lock);
 
+	/* RL-PAGE-REPLACEMENT: Select policy for this isolation batch */
+	sc->selected_policy = rl_select_policy();
 	nr_taken = isolate_lru_folios(nr_to_scan, lruvec, &folio_list,
-				     &nr_scanned, sc, lru);
+				     &nr_scanned, sc, lru, sc->selected_policy);
 
 	__mod_node_page_state(pgdat, NR_ISOLATED_ANON + file, nr_taken);
 	item = PGSCAN_KSWAPD + reclaimer_offset();
@@ -2553,8 +2567,10 @@ static void shrink_active_list(unsigned long nr_to_scan,
 
 	spin_lock_irq(&lruvec->lru_lock);
 
+	/* RL-PAGE-REPLACEMENT: Select policy for active list demotion */
+	sc->selected_policy = rl_select_policy();
 	nr_taken = isolate_lru_folios(nr_to_scan, lruvec, &l_hold,
-				     &nr_scanned, sc, lru);
+				     &nr_scanned, sc, lru, sc->selected_policy);
 
 	__mod_node_page_state(pgdat, NR_ISOLATED_ANON + file, nr_taken);
 
