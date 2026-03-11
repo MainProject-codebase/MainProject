@@ -2078,6 +2078,8 @@ unsigned int reclaim_clean_pages_from_list(struct zone *zone,
 	 * change in the future.
 	 */
 	noreclaim_flag = memalloc_noreclaim_save();
+	/* RL-PAGE-REPLACEMENT: Select policy for clean page reclaim */
+	sc.selected_policy = rl_select_policy();
 	nr_reclaimed = shrink_folio_list(&clean_folios, zone->zone_pgdat, &sc,
 					&stat, true);
 	memalloc_noreclaim_restore(noreclaim_flag);
@@ -2666,6 +2668,8 @@ static unsigned int reclaim_folio_list(struct list_head *folio_list,
 		.no_demotion = 1,
 	};
 
+	/* RL-PAGE-REPLACEMENT: Select policy for this reclaim batch */
+	sc.selected_policy = rl_select_policy();
 	nr_reclaimed = shrink_folio_list(folio_list, pgdat, &sc, &stat, true);
 	while (!list_empty(folio_list)) {
 		folio = lru_to_folio(folio_list);
@@ -5143,6 +5147,8 @@ static int evict_folios(struct lruvec *lruvec, struct scan_control *sc, int swap
 	if (list_empty(&list))
 		return scanned;
 retry:
+	/* RL-PAGE-REPLACEMENT: Select policy for LRU_GEN eviction */
+	sc->selected_policy = rl_select_policy();
 	/* RL-PAGE-REPLACEMENT: Pure LRU - ignore reference bits (LRU_GEN path)
 	 * OLD CODE (clock/second-chance algorithm):
 	 * reclaimed = shrink_folio_list(&list, pgdat, sc, &stat, false);
