@@ -430,6 +430,15 @@ extern unsigned long mem_cgroup_shrink_node(struct mem_cgroup *mem,
 						unsigned long *nr_scanned);
 extern unsigned long shrink_all_memory(unsigned long nr_pages);
 extern int vm_swappiness;
+
+/* RL-based page replacement runtime tunables */
+extern int rl_page_replacement_enabled;
+extern int sysctl_rl_exploration_rate;
+extern int sysctl_rl_score_penalty;
+extern int sysctl_rl_initial_score;
+extern int sysctl_rl_min_score;
+extern int sysctl_rl_max_score;
+
 long remove_mapping(struct address_space *mapping, struct folio *folio);
 
 #ifdef CONFIG_NUMA
@@ -450,6 +459,9 @@ void check_move_unevictable_folios(struct folio_batch *fbatch);
 
 extern void __meminit kswapd_run(int nid);
 extern void __meminit kswapd_stop(int nid);
+
+/* Page fault tracking */
+extern void track_page_fault(int fault_type);
 
 #ifdef CONFIG_SWAP
 

@@ -117,15 +117,20 @@ struct eviction_history {
 
 /*
  * RL-based Page Replacement Configuration
+ * Fixed table dimensions (compile-time) - changing at runtime would require reallocation
  */
 #define RL_PECH_HASH_BUCKETS 128     /* Number of hash buckets */
 #define RL_PECH_BUCKET_SIZE 4        /* Entries per bucket */
 #define RL_PECH_TABLE_SIZE (RL_PECH_HASH_BUCKETS * RL_PECH_BUCKET_SIZE) /* 512 total entries */
-#define RL_EXPLORATION_RATE 20       /* Exploration probability (out of 100) */
-#define RL_SCORE_PENALTY -10         /* Score decrease on page re-fault */
-#define RL_INITIAL_SCORE 100         /* Initial score for each policy */
-#define RL_MIN_SCORE -1000           /* Minimum allowed score */
-#define RL_MAX_SCORE 10000           /* Maximum allowed score */
+
+/*
+ * Runtime-tunable RL parameters (modifiable via sysctl /proc/sys/vm/rl_*)
+ */
+int sysctl_rl_exploration_rate __read_mostly = 20;   /* Exploration probability (out of 100) */
+int sysctl_rl_score_penalty __read_mostly = -10;     /* Score decrease on page re-fault */
+int sysctl_rl_initial_score __read_mostly = 100;     /* Initial score for each policy */
+int sysctl_rl_min_score __read_mostly = -1000;       /* Minimum allowed score */
+int sysctl_rl_max_score __read_mostly = 10000;       /* Maximum allowed score */
 
 /*
  * Policy Score Table (PolS)
@@ -158,7 +163,7 @@ static void __init init_pols_table(void)
 
 	for (i = 0; i < POLICY_MAX; i++) {
 		pols_table[i].policy = i;
-		pols_table[i].score = RL_INITIAL_SCORE;
+		pols_table[i].score = sysctl_rl_initial_score;
 	}
 
 #ifdef CONFIG_RL_MM_DEBUG
@@ -307,10 +312,10 @@ static void pols_update_score(enum policy_type policy, int delta)
 	pols_table[policy].score += delta;
 
 	/* Enforce bounds */
-	if (pols_table[policy].score < RL_MIN_SCORE)
-		pols_table[policy].score = RL_MIN_SCORE;
-	if (pols_table[policy].score > RL_MAX_SCORE)
-		pols_table[policy].score = RL_MAX_SCORE;
+	if (pols_table[policy].score < sysctl_rl_min_score)
+		pols_table[policy].score = sysctl_rl_min_score;
+	if (pols_table[policy].score > sysctl_rl_max_score)
+		pols_table[policy].score = sysctl_rl_max_score;
 
 	spin_unlock_irqrestore(&pols_lock, flags);
 
@@ -339,7 +344,7 @@ static enum policy_type rl_select_policy(void)
 	/* Epsilon-greedy: explore vs exploit */
 	rand_val = get_random_u32_below(100);
 
-	if (rand_val < RL_EXPLORATION_RATE) {
+	if (rand_val < sysctl_rl_exploration_rate) {
 		/* Explore: choose random policy */
 		selected = get_random_u32_below(POLICY_MAX);
 
@@ -386,7 +391,7 @@ void rl_handle_page_fault(pid_t pid, unsigned long page_id)
 
 	if (evicted_by_policy >= 0 && evicted_by_policy < POLICY_MAX) {
 		/* Page was recently evicted - penalize that policy */
-		pols_update_score(evicted_by_policy, RL_SCORE_PENALTY);
+		pols_update_score(evicted_by_policy, sysctl_rl_score_penalty);
 
 #ifdef CONFIG_RL_MM_DEBUG
 		pr_debug("RL-MM: Page fault on recently evicted page - penalizing policy %d\n",
@@ -461,9 +466,9 @@ static int rl_mm_stats_show(struct seq_file *m, void *v)
 
 	seq_printf(m, "\nConfiguration:\n");
 	seq_printf(m, "  Enabled: %s\n", rl_page_replacement_enabled ? "Yes" : "No");
-	seq_printf(m, "  Exploration rate: %d%%\n", RL_EXPLORATION_RATE);
-	seq_printf(m, "  Score penalty: %d\n", RL_SCORE_PENALTY);
-	seq_printf(m, "  Score range: [%d, %d]\n", RL_MIN_SCORE, RL_MAX_SCORE);
+	seq_printf(m, "  Exploration rate: %d%%\n", sysctl_rl_exploration_rate);
+	seq_printf(m, "  Score penalty: %d\n", sysctl_rl_score_penalty);
+	seq_printf(m, "  Score range: [%d, %d]\n", sysctl_rl_min_score, sysctl_rl_max_score);
 
 	return 0;
 }

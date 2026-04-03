@@ -2234,6 +2234,54 @@ static const struct ctl_table vm_table[] = {
 		.extra2		= (void *)&mmap_rnd_compat_bits_max,
 	},
 #endif
+	{
+		.procname	= "rl_enabled",
+		.data		= &rl_page_replacement_enabled,
+		.maxlen		= sizeof(rl_page_replacement_enabled),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec_minmax,
+		.extra1		= SYSCTL_ZERO,
+		.extra2		= SYSCTL_ONE,
+	},
+	{
+		.procname	= "rl_exploration_rate",
+		.data		= &sysctl_rl_exploration_rate,
+		.maxlen		= sizeof(sysctl_rl_exploration_rate),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec_minmax,
+		.extra1		= SYSCTL_ZERO,
+		.extra2		= SYSCTL_ONE_HUNDRED,
+	},
+	{
+		.procname	= "rl_score_penalty",
+		.data		= &sysctl_rl_score_penalty,
+		.maxlen		= sizeof(sysctl_rl_score_penalty),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec,
+	},
+	{
+		.procname	= "rl_initial_score",
+		.data		= &sysctl_rl_initial_score,
+		.maxlen		= sizeof(sysctl_rl_initial_score),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec_minmax,
+		.extra1		= SYSCTL_ZERO,
+		.extra2		= SYSCTL_INT_MAX,
+	},
+	{
+		.procname	= "rl_min_score",
+		.data		= &sysctl_rl_min_score,
+		.maxlen		= sizeof(sysctl_rl_min_score),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec,
+	},
+	{
+		.procname	= "rl_max_score",
+		.data		= &sysctl_rl_max_score,
+		.maxlen		= sizeof(sysctl_rl_max_score),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec,
+	},
 };
 
 int __init sysctl_init_bases(void)
