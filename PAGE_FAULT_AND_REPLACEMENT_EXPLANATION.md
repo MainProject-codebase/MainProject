@@ -193,40 +193,228 @@ static unsigned long shrink_zone(struct lruvec *lruvec,
 
 #### 2. **Shrinking Folio Lists**
 
+**File:** `mm/vmscan.c`
+
 ```c
-static unsigned long shrink_folio_list(struct list_head *folio_list,
-                                       struct pglist_data *pgdat,
-                                       struct scan_control *sc)
+static unsigned int shrink_folio_list(struct list_head *folio_list,
+        struct pglist_data *pgdat, struct scan_control *sc,
+        struct reclaim_stat *stat, bool ignore_references)
 ```
 
-**Process:**
+**Parameters:**
+- `folio_list`: List of isolated folios (pages) to consider for reclaim
+- `pgdat`: The NUMA node data structure the folios belong to
+- `sc`: Scan control parameters (GFP flags, reclaim limits, etc.)
+- `stat`: Output statistics (dirty, writeback, activated, reclaimed counts)
+- `ignore_references`: When `true`, skip reference checking (used in forced reclaim paths)
 
-**Step 1: Page Status Check**
+**Return value:** Number of base pages successfully reclaimed.
+
+**Purpose:**
+
+`shrink_folio_list()` is the heart of the page reclaim engine. It takes a list of
+candidate folios that have already been isolated from the LRU lists, evaluates
+each one, and either frees it (reclaims the memory) or puts it back.
+
+**Detailed Processing Flow:**
+
+For each folio in `folio_list`, the function performs the following steps in order:
+
+**Step 1: Lock the folio**
 ```c
-// Check if page is still referenced
-if (folio_referenced(folio) > 0) {
-    // Page is still in use, keep it
-    continue;
+if (!folio_trylock(folio))
+    goto keep;   // Cannot lock — put back on LRU as-is
+```
+A non-blocking trylock is used to avoid deadlocks. If the lock is unavailable,
+the folio is returned to the caller list unchanged.
+
+**Step 2: Handle hardware-poisoned pages**
+
+If the folio contains a hardware-poisoned (Uncorrectable Memory Error, UCE) page:
+- Large folios are skipped (`memory_failure()` will handle them when the UCE is triggered again).
+- Small folios are unmapped via `unmap_poisoned_folio()` and released.
+
+**Step 3: Check evictability**
+```c
+if (unlikely(!folio_evictable(folio)))
+    goto activate_locked;   // Move to active LRU, do not reclaim
+```
+Unevictable folios (e.g., `mlock`ed pages) are moved to the unevictable LRU
+rather than being freed.
+
+**Step 4: Respect mapping restrictions**
+```c
+if (!sc->may_unmap && folio_mapped(folio))
+    goto keep_locked;
+```
+If the scan control disallows unmapping and the folio is still mapped into
+process page tables, skip it.
+
+**Step 5: Account dirty and writeback state**
+
+Dirty and writeback counts are gathered into `stat` for the caller's congestion
+accounting. If too many folios are cycling through writeback, the node is marked
+as congested and kswapd will stall.
+
+**Step 6: Handle folios currently under writeback**
+
+Three sub-cases exist:
+
+| Case | Condition | Action |
+|------|-----------|--------|
+| 1 | kswapd + reclaim flag set + node writeback congested | Activate folio; note `nr_immediate` |
+| 2 | Normal writeback throttling in effect, or reclaim flag not yet set, or fs I/O not allowed | Set reclaim flag, activate folio |
+| 3 | cgroup-v1 memcg reclaim with reclaim flag already set | Wait for writeback (`folio_wait_writeback()`), then retry |
+
+Cases 1 and 2 activate the folio so it moves out of the reclaim path while
+clean folios are scanned. Case 3 blocks to prevent OOM in cgroup-v1 memory
+cgroups, which lack the adaptive dirty-throttling of the modern cgroup-v2
+path and would otherwise run out of memory if too many folios were under
+concurrent writeback.
+
+**Step 7: Check page references (unless `ignore_references`)**
+```c
+references = folio_check_references(folio, sc);
+switch (references) {
+case FOLIOREF_ACTIVATE:       goto activate_locked;   // Recently used
+case FOLIOREF_KEEP:           goto keep_locked;        // Keep on inactive list
+case FOLIOREF_RECLAIM:        /* fall through to reclaim */
+case FOLIOREF_RECLAIM_CLEAN:  /* fall through to reclaim */
 }
 ```
+`folio_check_references()` checks PTE-level access bits and the folio's own
+referenced flag. Folios that were recently accessed get a second chance via
+`FOLIOREF_ACTIVATE` or `FOLIOREF_KEEP`.
 
-**Step 2: Dirty Page Handling**
+**Step 8: NUMA demotion (tiered memory)**
 ```c
-// Check if page has been modified
-if (folio_test_dirty(folio)) {
-    // Write dirty page back to disk/swap
-    if (!pageout(folio, mapping, sc)) {
-        // I/O blocked, try later
-        continue;
+if (do_demote_pass && ...)
+    list_add(&folio->lru, &demote_folios);   // Try moving to lower-tier node
+```
+On systems with tiered memory (e.g., DRAM + PMEM), folios are first attempted
+to be migrated to a cheaper tier before being fully reclaimed. `do_demote_pass`
+is `true` on the first pass through the loop; after demotion has been attempted
+and failed for some folios, those folios are retried with `do_demote_pass = false`
+so they can still be reclaimed directly from the top-tier node.
+
+**Step 9: Add anonymous folios to swap cache**
+```c
+if (folio_test_anon(folio) && folio_test_swapbacked(folio)) {
+    if (!folio_test_swapcache(folio)) {
+        if (!add_to_swap(folio))
+            goto activate_locked;   // No swap space; re-activate
     }
 }
 ```
+Anonymous pages (not backed by a file) must be written to swap space before
+they can be freed. `add_to_swap()` allocates a swap slot and adds the folio to
+the swap cache. If the folio is large (THP), it is split first if possible.
 
-**Step 3: Page Removal**
+**Step 10: Unmap the folio from all process page tables**
 ```c
-// If all checks pass, remove the page
-folio_list_del(folio);
-folio_put(folio);  // Decrement reference count
+if (folio_mapped(folio)) {
+    try_to_unmap(folio, flags);
+    if (folio_mapped(folio))
+        goto activate_locked;   // Unmap failed; re-activate
+}
+```
+`try_to_unmap()` walks the reverse mapping (rmap) to remove the folio's PTEs
+from all processes that have it mapped. Large folios additionally use `TTU_SYNC`
+to avoid races with parallel PTE writes. If unmapping fails, the folio is
+re-activated.
+
+**Step 11: Check for DMA pinning**
+```c
+if (folio_maybe_dma_pinned(folio))
+    goto activate_locked;
+```
+Folios that are DMA-pinned by a device driver cannot be moved or freed.
+
+**Step 12: Handle dirty folios — trigger writeback**
+```c
+if (folio_test_dirty(folio)) {
+    // File-backed: only kswapd writes back; non-kswapd paths skip
+    if (folio_is_file_lru(folio) && ...)
+        goto activate_locked;
+
+    // Use pageout() to initiate async writeback
+    switch (pageout(folio, mapping, &plug, folio_list)) {
+    case PAGE_KEEP:     goto keep_locked;
+    case PAGE_ACTIVATE: goto activate_locked;
+    case PAGE_SUCCESS:  /* check if writeback completed synchronously */
+    case PAGE_CLEAN:    /* proceed to free */
+    }
+}
+```
+`pageout()` calls the mapping's `->writepage()` operation to start I/O. Only
+kswapd writes back file-backed dirty folios to avoid stack overflows; direct
+reclaim skips them. Anonymous dirty folios (in swap cache) are always written
+back.
+
+**Step 13: Release buffer-head mappings**
+```c
+if (folio_needs_release(folio))
+    if (!filemap_release_folio(folio, sc->gfp_mask))
+        goto activate_locked;
+```
+Folios with buffer heads (block I/O metadata) must have those released before
+the folio itself can be freed.
+
+**Step 14: Remove folio from its address space**
+```c
+// Lazyfree anonymous folio (no swap backing needed)
+if (folio_test_anon(folio) && !folio_test_swapbacked(folio)) {
+    folio_ref_freeze(folio, 1);
+    count_vm_events(PGLAZYFREED, nr_pages);
+} else if (!mapping || !__remove_mapping(mapping, folio, true, ...))
+    goto keep_locked;
+```
+File-backed folios and swap-backed anonymous folios are removed from their
+address space (page cache or swap cache) via `__remove_mapping()`. Lazyfree
+folios (anonymous pages that were marked free via `madvise(MADV_FREE)` but
+not yet reclaimed) are simply frozen.
+
+**Step 15: Free the folio**
+```c
+nr_reclaimed += nr_pages;
+folio_unqueue_deferred_split(folio);
+folio_batch_add(&free_folios, folio);   // Batched for efficiency
+```
+Reclaimed folios are accumulated in `free_folios` and freed in batches via
+`free_unref_folios()` to amortize the cost of memory cgroup uncharging and
+TLB flush operations.
+
+**Post-loop: NUMA demotion retry**
+
+After processing all folios, the function tries to migrate the demote candidates
+to lower-tier NUMA nodes via `demote_folio_list()`. Folios that could not be
+demoted are recycled back into `folio_list` and the entire loop is retried
+once (with `do_demote_pass = false`), so they get a chance to be reclaimed
+from the top-tier node. This retry is suppressed during proactive reclaim.
+
+**Decision Summary Diagram**
+
+```
+For each folio:
+    ├─ Can't lock?              → keep (return to LRU)
+    ├─ HW poisoned?             → unmap small / skip large
+    ├─ Not evictable?           → activate (move to active LRU)
+    ├─ Can't unmap + mapped?    → keep
+    ├─ Under writeback?
+    │   ├─ Case 1 (congested)   → activate
+    │   ├─ Case 2 (normal)      → activate (set reclaim flag)
+    │   └─ Case 3 (legacy cg)   → wait, retry
+    ├─ Recently referenced?
+    │   ├─ ACTIVATE             → activate
+    │   └─ KEEP                 → keep
+    ├─ Demotable?               → defer to demotion list
+    ├─ Anon + swap-backed?      → add_to_swap (allocate swap slot)
+    ├─ Mapped?                  → try_to_unmap (remove PTEs)
+    ├─ DMA pinned?              → activate
+    ├─ Dirty?                   → pageout (start writeback)
+    ├─ Has buffer heads?        → filemap_release_folio
+    ├─ Remove from mapping      → __remove_mapping / ref_freeze
+    └─ SUCCESS                  → free folio, increment nr_reclaimed
 ```
 
 ### LRU (Least Recently Used) Lists
